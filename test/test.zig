@@ -18,9 +18,7 @@ pub fn addTests(b: *Build, comp: *Compile, build_opts: struct {
         error.InvalidUtf8 => @panic("InvalidUtf8"),
         error.OutOfMemory => @panic("OOM"),
     };
-
-    const zld = FileSourceWithDir.fromFileSource(b, comp.getOutputSource(), "ld");
-
+    const zld = WriteFile.create(b).addCopyFile(comp.getEmittedBin(), "ld");
     const opts: Options = .{
         .zld = zld,
         .system_compiler = system_compiler,
@@ -42,7 +40,7 @@ pub const SystemCompiler = enum {
 };
 
 pub const Options = struct {
-    zld: FileSourceWithDir,
+    zld: LazyPath,
     system_compiler: SystemCompiler,
     has_static: bool = false,
     has_zig: bool = false,
@@ -51,10 +49,10 @@ pub const Options = struct {
 };
 
 /// A system command that tracks the command itself via `cmd` Step.Run and output file
-/// via `out` FileSource.
+/// via `out` LazyPath.
 pub const SysCmd = struct {
     cmd: *Run,
-    out: FileSource,
+    out: LazyPath,
 
     pub fn addArg(sys_cmd: SysCmd, arg: []const u8) void {
         sys_cmd.cmd.addArg(arg);
@@ -64,19 +62,19 @@ pub const SysCmd = struct {
         sys_cmd.cmd.addArgs(args);
     }
 
-    pub fn addFileSource(sys_cmd: SysCmd, file: FileSource) void {
-        sys_cmd.cmd.addFileSourceArg(file);
+    pub fn addFileSource(sys_cmd: SysCmd, file: LazyPath) void {
+        sys_cmd.cmd.addFileArg(file);
     }
 
-    pub fn addPrefixedFileSource(sys_cmd: SysCmd, prefix: []const u8, file: FileSource) void {
-        sys_cmd.cmd.addPrefixedFileSourceArg(prefix, file);
+    pub fn addPrefixedFileSource(sys_cmd: SysCmd, prefix: []const u8, file: LazyPath) void {
+        sys_cmd.cmd.addPrefixedFileArg(prefix, file);
     }
 
-    pub fn addDirectorySource(sys_cmd: SysCmd, dir: FileSource) void {
+    pub fn addDirectorySource(sys_cmd: SysCmd, dir: LazyPath) void {
         sys_cmd.cmd.addDirectorySourceArg(dir);
     }
 
-    pub fn addPrefixedDirectorySource(sys_cmd: SysCmd, prefix: []const u8, dir: FileSource) void {
+    pub fn addPrefixedDirectorySource(sys_cmd: SysCmd, prefix: []const u8, dir: LazyPath) void {
         sys_cmd.cmd.addPrefixedDirectorySourceArg(prefix, dir);
     }
 
@@ -96,11 +94,16 @@ pub const SysCmd = struct {
         return sys_cmd.addSourceBytes(bytes, .zig);
     }
 
+    pub inline fn addObjCSource(sys_cmd: SysCmd, bytes: []const u8) void {
+        return sys_cmd.addSourceBytes(bytes, .objc);
+    }
+
     pub const FileType = enum {
         c,
         cpp,
         @"asm",
         zig,
+        objc,
     };
 
     pub fn addSourceBytes(sys_cmd: SysCmd, bytes: []const u8, @"type": FileType) void {
@@ -111,8 +114,9 @@ pub const SysCmd = struct {
             .cpp => "a.cpp",
             .@"asm" => "a.s",
             .zig => "a.zig",
+            .objc => "a.m",
         }, bytes);
-        sys_cmd.cmd.addFileSourceArg(file);
+        sys_cmd.cmd.addFileArg(file);
     }
 
     pub inline fn addEmptyMain(sys_cmd: SysCmd) void {
@@ -133,8 +137,12 @@ pub const SysCmd = struct {
         );
     }
 
-    pub fn saveOutputAs(sys_cmd: SysCmd, basename: []const u8) FileSourceWithDir {
-        return FileSourceWithDir.fromFileSource(sys_cmd.cmd.step.owner, sys_cmd.out, basename);
+    pub inline fn getFile(sys_cmd: SysCmd) LazyPath {
+        return sys_cmd.out;
+    }
+
+    pub inline fn getDir(sys_cmd: SysCmd) LazyPath {
+        return sys_cmd.out.dirname();
     }
 
     pub fn check(sys_cmd: SysCmd) *CheckObject {
@@ -147,7 +155,7 @@ pub const SysCmd = struct {
     pub fn run(sys_cmd: SysCmd) RunSysCmd {
         const b = sys_cmd.cmd.step.owner;
         const r = Run.create(b, "exec");
-        r.addFileSourceArg(sys_cmd.out);
+        r.addFileArg(sys_cmd.out);
         r.step.dependOn(&sys_cmd.cmd.step);
         return .{ .run = r };
     }
@@ -164,7 +172,23 @@ pub const RunSysCmd = struct {
         rsc.run.expectStdOutEqual(exp);
     }
 
-    pub inline fn expectExitCode(rsc: RunSysCmd, code: u8) void {
+    pub fn expectStdOutFuzzy(rsc: RunSysCmd, exp: []const u8) void {
+        rsc.run.addCheck(.{
+            .expect_stdout_match = rsc.run.step.owner.dupe(exp),
+        });
+    }
+
+    pub inline fn expectStdErrEqual(rsc: RunSysCmd, exp: []const u8) void {
+        rsc.run.expectStdErrEqual(exp);
+    }
+
+    pub fn expectStdErrFuzzy(rsc: RunSysCmd, exp: []const u8) void {
+        rsc.run.addCheck(.{
+            .expect_stderr_match = rsc.run.step.owner.dupe(exp),
+        });
+    }
+
+    pub fn expectExitCode(rsc: RunSysCmd, code: u8) void {
         rsc.run.expectExitCode(code);
     }
 
@@ -173,30 +197,10 @@ pub const RunSysCmd = struct {
     }
 };
 
-/// When going over different linking scenarios, we usually want to save a file
-/// at a particular location however we do not specify the path to file explicitly
-/// on the linker line. Instead, we specify its basename like `-la` and provide
-/// the search directory with a matching companion flag `-L.`.
-/// This abstraction tie the full path of a file with its immediate directory to make
-/// the above scenario possible.
-pub const FileSourceWithDir = struct {
-    dir: FileSource,
-    file: FileSource,
-
-    pub fn fromFileSource(b: *Build, in_file: FileSource, basename: []const u8) FileSourceWithDir {
-        const wf = WriteFile.create(b);
-        const dir = wf.getDirectorySource();
-        const file = wf.addCopyFile(in_file, basename);
-        return .{ .dir = dir, .file = file };
-    }
-
-    pub fn fromBytes(b: *Build, bytes: []const u8, basename: []const u8) FileSourceWithDir {
-        const wf = WriteFile.create(b);
-        const dir = wf.getDirectorySource();
-        const file = wf.add(basename, bytes);
-        return .{ .dir = dir, .file = file };
-    }
-};
+pub fn saveBytesToFile(b: *Build, name: []const u8, bytes: []const u8) LazyPath {
+    const wf = WriteFile.create(b);
+    return wf.add(name, bytes);
+}
 
 pub const SkipTestStep = struct {
     pub const base_id = .custom;
@@ -239,7 +243,7 @@ const macho = @import("macho.zig");
 const Build = std.Build;
 const CheckObject = Step.CheckObject;
 const Compile = Step.Compile;
-const FileSource = Build.FileSource;
+const LazyPath = Build.LazyPath;
 const Run = Step.Run;
 const Step = Build.Step;
 const WriteFile = Step.WriteFile;
