@@ -438,8 +438,8 @@ const usage =
     \\-v, --version                 Print version
     \\-V                            Print version and target information
     \\
-    \\ld.zld: supported target: elf64-x86-64, elf64-littleaarch64, elf64-littleriscv
-    \\ld.zld: supported emulations: elf64_x86_64, aarch64linux, aarch64elf, elf64lriscv
+    \\ld.zld: supported target: elf64-x86-64, elf64-littleaarch64, elf64-littleriscv, elf64-powerpcle
+    \\ld.zld: supported emulations: elf64_x86_64, aarch64linux, aarch64elf, elf64lriscv, elf64lppc
 ;
 
 pub const version =
@@ -451,6 +451,7 @@ fn cpuArchToElfEmulation(cpu_arch: std.Target.Cpu.Arch) []const u8 {
         .x86_64 => "elf_x86_64",
         .aarch64 => "aarch64linux",
         .riscv64 => "elf64lriscv",
+        .powerpc64 => "elf64lppc",
         else => unreachable,
     };
 }
@@ -459,6 +460,7 @@ const supported_emulations = [_]struct { std.Target.Cpu.Arch, u64 }{
     .{ .x86_64, 0x1000 },
     .{ .aarch64, 0x10000 },
     .{ .riscv64, 0x1000 },
+    .{ .powerpc64, 0x10000 },
 };
 
 fn cpuArchFromElfEmulation(value: []const u8) ?std.Target.Cpu.Arch {

@@ -51,6 +51,7 @@ rela_iplt_start_index: ?u32 = null,
 rela_iplt_end_index: ?u32 = null,
 end_index: ?u32 = null,
 global_pointer_index: ?u32 = null,
+toc: ?u32 = null,
 start_stop_indexes: std.ArrayListUnmanaged(u32) = .{},
 
 entry_index: ?u32 = null,
@@ -1800,6 +1801,23 @@ fn allocateSyntheticSymbols(self: *Elf) void {
             sym.shndx = 0;
         }
     }
+
+    // .TOC.
+    if (self.toc) |index| {
+        const sym = self.getSymbol(index);
+        if (self.getSectionByName(".got")) |shndx| {
+            const shdr = self.sections.items(.shdr)[shndx];
+            sym.value = @intCast(shdr.sh_addr + 0x8000);
+            sym.shndx = shndx;
+        } else if (self.getSectionByName(".toc")) |shndx| {
+            const shdr = self.sections.items(.shdr)[shndx];
+            sym.value = @intCast(shdr.sh_addr + 0x8000);
+            sym.shndx = shndx;
+        } else {
+            sym.value = 0;
+            sym.shndx = 0;
+        }
+    }
 }
 
 fn parsePositional(self: *Elf, arena: Allocator, obj: LinkObject, search_dirs: []const []const u8) anyerror!void {
@@ -2177,6 +2195,10 @@ fn resolveSyntheticSymbols(self: *Elf) !void {
 
     if (self.options.cpu_arch.? == .riscv64 and !is_shared) {
         self.global_pointer_index = try internal.addSyntheticGlobal("__global_pointer$", self);
+    }
+
+    if (self.options.cpu_arch.? == .powerpc64) {
+        self.toc = try internal.addSyntheticGlobal(".TOC.", self);
     }
 
     internal.resolveSymbols(self);
@@ -3045,6 +3067,8 @@ pub fn getTpAddress(self: *Elf) i64 {
     const addr = switch (self.options.cpu_arch.?) {
         .x86_64 => mem.alignForward(u64, phdr.p_vaddr + phdr.p_memsz, phdr.p_align),
         .aarch64 => mem.alignBackward(u64, phdr.p_vaddr - 16, phdr.p_align),
+        .riscv64 => phdr.p_vaddr,
+        .powerpc64 => phdr.p_vaddr + 0x7000,
         else => @panic("TODO implement getTpAddress for this arch"),
     };
     return @intCast(addr);
@@ -3065,7 +3089,7 @@ pub fn getTlsAddress(self: *Elf) i64 {
 fn requiresThunks(self: Elf) bool {
     return switch (self.options.cpu_arch.?) {
         .aarch64 => true,
-        .x86_64, .riscv64 => false,
+        .x86_64, .riscv64, .powerpc64 => false,
         else => @panic("unsupported architecture"),
     };
 }

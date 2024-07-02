@@ -232,6 +232,9 @@ pub fn scanRelocs(self: Atom, elf_file: *Elf) !void {
             .riscv64 => riscv.scanReloc(self, elf_file, rel, symbol, code, &it) catch {
                 has_reloc_errors = true;
             },
+            .powerpc64 => powerpc64.scanReloc(self, elf_file, rel, symbol, code, &it) catch {
+                has_reloc_errors = true;
+            },
             else => |arch| {
                 elf_file.base.fatal("TODO support {s} architecture", .{@tagName(arch)});
                 return error.UnhandledCpuArch;
@@ -520,6 +523,10 @@ pub fn resolveRelocsAlloc(self: Atom, elf_file: *Elf, writer: anytype) !void {
                 error.RelocError => has_reloc_errors = true,
                 else => |e| return e,
             },
+            .powerpc64 => powerpc64.resolveRelocAlloc(self, elf_file, rel, target, args, &it, code, &stream) catch |err| switch (err) {
+                error.RelocError => has_reloc_errors = true,
+                else => |e| return e,
+            },
             else => |arch| {
                 elf_file.base.fatal("TODO support {s} architecture", .{@tagName(arch)});
                 return error.UnhandledCpuArch;
@@ -681,6 +688,10 @@ pub fn resolveRelocsNonAlloc(self: Atom, elf_file: *Elf, writer: anytype) !void 
                 else => |e| return e,
             },
             .riscv64 => riscv.resolveRelocNonAlloc(self, elf_file, rel, target, args, &it, code, &stream) catch |err| switch (err) {
+                error.RelocError => has_reloc_errors = true,
+                else => |e| return e,
+            },
+            .powerpc64 => powerpc64.resolveRelocNonAlloc(self, elf_file, rel, target, args, &it, code, &stream) catch |err| switch (err) {
                 error.RelocError => has_reloc_errors = true,
                 else => |e| return e,
             },
@@ -1830,6 +1841,205 @@ const riscv = struct {
     }
 
     const riscv_util = @import("../riscv.zig");
+};
+
+const powerpc64 = struct {
+    fn scanReloc(
+        atom: Atom,
+        elf_file: *Elf,
+        rel: elf.Elf64_Rela,
+        symbol: *Symbol,
+        code: []u8,
+        it: *RelocsIterator,
+    ) !void {
+        const tracy = trace(@src());
+        defer tracy.end();
+        _ = code;
+        _ = it;
+
+        const r_type: elf.R_PPC64 = @enumFromInt(rel.r_type());
+        switch (r_type) {
+            .ADDR64 => {
+                const name = symbol.getName(elf_file);
+                if (mem.eql(u8, name, ".toc")) {
+                    elf_file.base.fatal("{s}: todo .toc scan", .{atom.getName(elf_file)});
+                    return error.RelocError;
+                } else {
+                    try atom.scanReloc(symbol, rel, getDynAbsRelocAction(symbol, elf_file), elf_file);
+                }
+            },
+
+            .REL24 => if (symbol.flags.import) {
+                symbol.flags.plt = true;
+            },
+
+            .TPREL16_HA,
+            .TPREL16_LO,
+            => if (elf_file.options.shared) {
+                try atom.picError(symbol, rel, elf_file);
+            },
+
+            .REL32,
+            .TOC16_HA,
+            .TOC16_LO,
+            .TOC16_LO_DS,
+            .TOC16_DS,
+            .REL16_HA,
+            .REL16_LO,
+            => {},
+
+            else => {
+                elf_file.base.fatal("{s}: unknown relocation type: {}", .{
+                    atom.getName(elf_file),
+                    relocation.fmtRelocType(rel.r_type(), .powerpc64),
+                });
+                return error.RelocError;
+            },
+        }
+    }
+
+    fn resolveRelocAlloc(
+        atom: Atom,
+        elf_file: *Elf,
+        rel: elf.Elf64_Rela,
+        target: *const Symbol,
+        args: ResolveArgs,
+        it: *RelocsIterator,
+        code: []u8,
+        stream: anytype,
+    ) !void {
+        const tracy = trace(@src());
+        defer tracy.end();
+        _ = it;
+        _ = code;
+
+        const r_type: elf.R_PPC64 = @enumFromInt(rel.r_type());
+
+        try stream.seekTo(rel.r_offset);
+        const cwriter = stream.writer();
+
+        const P, const A, const S, const GOT, const G, const TP, const DTP = args;
+
+        const toc_sym = elf_file.getSymbol(elf_file.toc.?);
+        const TOC = toc_sym.value;
+
+        _ = GOT;
+        _ = G;
+        _ = TP;
+        _ = DTP;
+
+        switch (r_type) {
+            .ADDR64 => {
+                const name = target.getName(elf_file);
+                if (mem.eql(u8, name, ".toc")) {
+                    elf_file.base.fatal("{s}: todo .toc scan", .{atom.getName(elf_file)});
+                    return error.RelocError;
+                } else {
+                    try atom.resolveDynAbsReloc(
+                        target,
+                        rel,
+                        getDynAbsRelocAction(target, elf_file),
+                        elf_file,
+                        cwriter,
+                    );
+                }
+            },
+            .REL32 => try cwriter.writeInt(u32, @intCast(S + A - P), .little),
+            .TOC16_LO => {
+                const val: u64 = @as(u64, @bitCast(S + A - TOC)) & 0xffff;
+                try cwriter.writeInt(u16, @truncate(val), .little);
+            },
+            .TOC16_HA => {
+                const val: u64 = (@as(u64, @intCast(S + A - TOC)) + 0x8000) >> 16;
+                try cwriter.writeInt(u16, @truncate(val), .little);
+            },
+            .REL24 => {
+                const object = atom.getObject(elf_file);
+                const rel_sym = object.symtab.items[rel.r_sym()];
+                const ppc_local_entry: u3 = @truncate(rel_sym.st_other >> 5);
+                assert(ppc_local_entry < 7);
+
+                var val: u64 = @bitCast(S + ppc_local_entry + A - P);
+                val = bitSlice(val, 25, 2) << 2;
+
+                try cwriter.writeInt(u32, @truncate(val), .little);
+            },
+            .REL16_LO => {
+                const val: u64 = @as(u64, @bitCast(S + A - P)) & 0xffff;
+                try cwriter.writeInt(u16, @truncate(val), .little);
+            },
+            .REL16_HA => {
+                const val: u64 = (@as(u64, @bitCast(S + A - P)) + 0x8000) >> 16;
+                try cwriter.writeInt(u16, @truncate(val), .little);
+            },
+            .TPREL16_HA => {
+                const val: u64 = (@as(u64, @bitCast(target.getGotTpAddress(elf_file) - TOC)) + 0x8000) >> 16;
+                try cwriter.writeInt(u16, @truncate(val), .little);
+            },
+            .TPREL16_LO => {
+                const val: u64 = @as(u64, @bitCast(target.getGotTpAddress(elf_file) - TOC)) & 0xffff;
+                try cwriter.writeInt(u16, @truncate(val), .little);
+            },
+            .TOC16_LO_DS => {
+                const val: u64 = @as(u64, @bitCast(S + A - TOC)) & 0xfffc;
+                try cwriter.writeInt(u16, @truncate(val), .little);
+            },
+            else => {
+                elf_file.base.fatal("unhandled relocation type: {}", .{
+                    relocation.fmtRelocType(rel.r_type(), .powerpc64),
+                });
+                return error.RelocError;
+            },
+        }
+    }
+
+    fn resolveRelocNonAlloc(
+        atom: Atom,
+        elf_file: *Elf,
+        rel: elf.Elf64_Rela,
+        target: *const Symbol,
+        args: ResolveArgs,
+        it: *RelocsIterator,
+        code: []u8,
+        stream: anytype,
+    ) !void {
+        const tracy = trace(@src());
+        defer tracy.end();
+        _ = it;
+
+        _ = code;
+        _ = target;
+
+        const r_type: elf.R_PPC64 = @enumFromInt(rel.r_type());
+
+        try stream.seekTo(rel.r_offset);
+        const cwriter = stream.writer();
+
+        _, const A, const S, const GOT, _, _, const DTP = args;
+        _ = GOT;
+        _ = DTP;
+
+        switch (r_type) {
+            .ADDR32 => try cwriter.writeInt(i32, @intCast(S + A), .little),
+            .ADDR64 => try cwriter.writeInt(i64, S + A, .little),
+
+            else => {
+                elf_file.base.fatal("{s}: invalid relocation type for non-alloc section: {}", .{
+                    atom.getName(elf_file),
+                    relocation.fmtRelocType(rel.r_type(), .powerpc64),
+                });
+                return error.RelocError;
+            },
+        }
+    }
+
+    fn bitSlice(
+        value: anytype,
+        comptime high: comptime_int,
+        comptime low: comptime_int,
+    ) std.math.IntFittingRange(0, 1 << high - low) {
+        return @truncate((value >> low) & (1 << (high - low + 1)) - 1);
+    }
 };
 
 const RelocsIterator = struct {
